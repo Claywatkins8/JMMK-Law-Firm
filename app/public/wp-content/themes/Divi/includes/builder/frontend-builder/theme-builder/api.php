@@ -133,6 +133,10 @@ add_action( 'wp_ajax_et_theme_builder_api_get_layout_url', 'et_theme_builder_api
 /**
  * Save the theme builder post.
  *
+ * The templates upload will be chunked into several POST requests with size 30 templates per request.
+ * Hence we need to store the uploaded templates data into temporary file in cache directory before
+ * making changes into database.
+ *
  * @since 4.0
  *
  * @return void
@@ -149,31 +153,79 @@ function et_theme_builder_api_save() {
 	$has_default      = false;
 	$updated_ids      = array();
 
+	// Always reset the cached templates on first request.
 	if ( $first_request ) {
-		delete_post_meta( $theme_builder_id, '_et_template' );
+		ET_Core_Cache_File::set( 'et_theme_builder_templates', array() );
 	}
 
-	foreach ( $templates as $template ) {
-		$raw_post_id = $_->array_get( $template, 'id', 0 );
-		$post_id     = is_numeric( $raw_post_id ) ? (int) $raw_post_id : 0;
-		$new_post_id = et_theme_builder_store_template( $theme_builder_id, $template, ! $has_default );
-		$is_default  = get_post_meta( $new_post_id, '_et_default', true ) === '1';
+	$cached_templates = ET_Core_Cache_File::get( 'et_theme_builder_templates' );
 
-		if ( $is_default ) {
-			$has_default = true;
-		}
-
-		if ( $new_post_id !== $post_id ) {
-			$updated_ids[ $raw_post_id ] = $new_post_id;
-		}
+	// Populate the templates.
+	foreach ( $templates as $index => $template ) {
+		$cached_templates[ $_->array_get( $template, 'id', 'unsaved_' . $index ) ] = $template;
 	}
+
+	// Store the populated templates data into the cache file.
+	ET_Core_Cache_File::set( 'et_theme_builder_templates', $cached_templates );
 
 	if ( $last_request ) {
+		$updated_templates  = array();
+		$existing_templates = get_post_meta( $theme_builder_id, '_et_template' );
+
+		if ( is_array( $existing_templates ) ) {
+			$existing_templates = array_map( 'intval', $existing_templates );
+		}
+
+		// Update or insert templates.
+		foreach ( $cached_templates as $template ) {
+			$raw_post_id = $_->array_get( $template, 'id', 0 );
+			$post_id     = is_numeric( $raw_post_id ) ? (int) $raw_post_id : 0;
+			$new_post_id = et_theme_builder_store_template( $theme_builder_id, $template, ! $has_default );
+
+			if ( ! $new_post_id ) {
+				continue;
+			}
+
+			$is_default = get_post_meta( $new_post_id, '_et_default', true ) === '1';
+
+			if ( $is_default ) {
+				$has_default = true;
+			}
+
+			if ( $new_post_id !== $post_id ) {
+				$updated_ids[ $raw_post_id ] = $new_post_id;
+			}
+
+			// Add template ID into $updated_templates for later use to delete existing template.
+			$updated_templates[] = $new_post_id;
+
+			// Add mapping template ID to theme builder ID.
+			if ( ! in_array( $new_post_id, $existing_templates, true ) ) {
+				add_post_meta( $theme_builder_id, '_et_template', $new_post_id );
+			}
+		}
+
+		// Delete existing templates.
+		if ( $existing_templates ) {
+			foreach ( $existing_templates as $existing_template_id ) {
+				if ( ! in_array( $existing_template_id, $updated_templates, true ) ) {
+					// Delete existing template when the ID is not exist in cached templates.
+					// Deletion will be done individually to prevent templates lost
+					// when user Stopping/Interrupting/Refreshing the saving process.
+					// @see https://github.com/elegantthemes/Divi/issues/23393.
+					delete_post_meta( $theme_builder_id, '_et_template', $existing_template_id );
+				}
+			}
+		}
+
 		if ( $live ) {
 			et_theme_builder_trash_draft_and_unused_posts();
 		}
 
 		et_theme_builder_clear_wp_cache( 'all' );
+
+		// Always reset the cached templates on last request after data stored into database.
+		ET_Core_Cache_File::set( 'et_theme_builder_templates', array() );
 	}
 
 	wp_send_json_success(
